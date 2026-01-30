@@ -3,7 +3,7 @@
   "private": true,
   "version": "0.0.0",
   "type": "module",
-  "homepage": "https://<YOUR_GITHUB_USERNAME>.github.io/pdfsearch",
+  "homepage": "https:cryogenic-ric.github.io/pdfsearch",
   "scripts": {
     "dev": "vite",
     "build": "tsc && vite build",
