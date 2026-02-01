@@ -1,190 +1,414 @@
-import { useState, useCallback, useEffect } from 'react';
-import { useDropzone } from 'react-dropzone';
-import { Worker, Viewer } from '@react-pdf-viewer/core';
-import { searchPlugin } from '@react-pdf-viewer/search';
-import { UploadCloud, Search, FileText, X } from 'lucide-react';
-import clsx from 'clsx';
+import {
+  useCallback,
+  useEffect,
+  useMemo,
+  useState,
+  type CSSProperties,
+} from "react";
+import { Document, Page, pdfjs } from "react-pdf";
+import { useDropzone } from "react-dropzone";
 
-// Import styles
-import '@react-pdf-viewer/core/lib/styles/index.css';
-import '@react-pdf-viewer/search/lib/styles/index.css';
+import "react-pdf/dist/esm/Page/AnnotationLayer.css";
+import "react-pdf/dist/esm/Page/TextLayer.css";
+import "./index.css";
 
-// Import pdf.js worker from the installed package
-import packageJson from '../package.json';
-const pdfjsVersion = packageJson.dependencies['pdfjs-dist'].replace('^', '');
+// Configure the PDF.js worker for Vite builds
+pdfjs.GlobalWorkerOptions.workerSrc = new URL(
+  "pdfjs-dist/build/pdf.worker.mjs",
+  import.meta.url,
+).toString();
 
-function App() {
-  const [file, setFile] = useState<File | null>(null);
-  const [fileUrl, setFileUrl] = useState<string>('');
-  const [searchText, setSearchText] = useState<string>('');
-  
-  // Initialize the search plugin
-  const searchPluginInstance = searchPlugin({
-    keyword: searchText,
-  });
-  const { highlight, clearHighlights } = searchPluginInstance;
+type FileLike = File | null;
 
-  // Cleanup ObjectURL when file changes
-  useEffect(() => {
-    return () => {
-      if (fileUrl) {
-        URL.revokeObjectURL(fileUrl);
+const App = () => {
+  const [file, setFile] = useState<FileLike>(null);
+  const [numPages, setNumPages] = useState<number>(0);
+  const [pageNumber, setPageNumber] = useState<number>(1);
+  const [scale, setScale] = useState<number>(1.0);
+  const [error, setError] = useState<string | null>(null);
+
+  const [highlightTerm] = useState<string | null>("deposited at");
+
+  // Utility: escape regex special characters
+  const escapeRegExp = (s: any) =>
+    s?.replace(/[.*+?^${}()|[\]\\]/g, "\\$&") ?? "";
+
+  // Utility: escape text for safe innerHTML injection when marking cross-span highlights
+  const escapeHTML = (s: any) =>
+    String(s ?? "")
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;")
+      .replace(/'/g, "&#39;");
+
+  /*
+   * Find all case-insensitive matches of term within text
+   */
+
+  // Apply highlighting for phrases that span multiple PDF text spans
+  const SEP = "\u0000"; // sentinel between spans (unlikely to appear in PDFs)
+
+  const buildCrossSpanRegex = (term: string) => {
+    // 1. Escape the entire term so we treat it as literal chars initially
+    // 2. We want to allow the "SEP" (span boundary) to occur optionally between any two characters,
+    //    and we want to treat spaces in the query as matching one-or-more whitespace/separators in the text.
+
+    const escaped = escapeRegExp(term.trim());
+    if (!escaped) return null;
+
+    const chars = term.trim().split("");
+    let corePattern = "";
+
+    for (let i = 0; i < chars.length; i++) {
+      const char = chars[i];
+      if (/\s/.test(char)) {
+        // It's a whitespace in the query
+        corePattern += `(?:\\s|${SEP})+`;
+      } else {
+        // It's a non-whitespace char
+        corePattern += escapeRegExp(char);
+        // Allow optional separator after it, unless it's the last char
+        if (i < chars.length - 1) {
+          corePattern += `(?:${SEP})*`;
+        }
       }
-    };
-  }, [fileUrl]);
+    }
 
-  const onDrop = useCallback((acceptedFiles: File[]) => {
-    if (acceptedFiles && acceptedFiles.length > 0) {
-      const pdfFile = acceptedFiles[0];
-      setFile(pdfFile);
-      setFileUrl(URL.createObjectURL(pdfFile));
-      setSearchText('');
+    // Wrap in whole-word boundaries.
+    const pattern = `(^|[^A-Za-z0-9])(${corePattern})(?=$|[^A-Za-z0-9])`;
+    return new RegExp(pattern, "gi");
+  };
+
+  const applyCrossSpanHighlight = (term: string | null) => {
+    try {
+      if (!term?.trim()) return false;
+
+      const textLayer = document.querySelector(
+        ".react-pdf__Page__textContent",
+      ) as HTMLElement | null;
+      if (!textLayer) return false;
+
+      // Remove previous cross-span highlights
+      textLayer.querySelectorAll('mark[data-cross="true"]').forEach((mark) => {
+        mark.replaceWith(...mark.childNodes);
+      });
+
+      // Only target the actual text spans inside the text layer
+      const spans = Array.from(textLayer.querySelectorAll("span"));
+      if (!spans.length) return false;
+
+      const contents = spans.map((s) => s.textContent ?? "");
+
+      // Build a virtual string that keeps a 1-char separator between spans.
+      let fullText = "";
+      for (let i = 0; i < contents.length; i++) {
+        fullText += contents[i];
+        if (i !== contents.length - 1) fullText += SEP;
+      }
+
+      const re = buildCrossSpanRegex(term);
+      if (!re) return false;
+
+      const matches: Array<{ start: number; end: number }> = [];
+      let m: RegExpExecArray | null;
+
+      while ((m = re.exec(fullText))) {
+        const prefixLen = m[1] ? m[1].length : 0;
+        const coreLen = m[2].length;
+        const matchStart = m.index + prefixLen;
+        const matchEnd = matchStart + coreLen;
+        matches.push({ start: matchStart, end: matchEnd });
+      }
+      if (!matches.length) return false;
+
+      // Map global indices back to spans
+      let cursor = 0;
+      for (let i = 0; i < spans.length; i++) {
+        const span = spans[i];
+        const spanText = contents[i];
+        const spanStart = cursor;
+        const spanEnd = cursor + spanText.length;
+
+        let newHTML = "";
+        let lastIndex = 0;
+
+        for (const { start, end } of matches) {
+          const overlapStart = Math.max(start, spanStart);
+          const overlapEnd = Math.min(end, spanEnd);
+
+          if (overlapStart < overlapEnd) {
+            const localStart = overlapStart - spanStart;
+            const localEnd = overlapEnd - spanStart;
+
+            newHTML += escapeHTML(spanText.slice(lastIndex, localStart));
+            newHTML += `<mark class="pdf-highlight" data-cross="true">${escapeHTML(
+              spanText.slice(localStart, localEnd),
+            )}</mark>`;
+            lastIndex = localEnd;
+          }
+        }
+
+        newHTML += escapeHTML(spanText.slice(lastIndex));
+
+        if (newHTML !== escapeHTML(spanText)) {
+          span.innerHTML = newHTML;
+        }
+
+        cursor = spanEnd + (i === spans.length - 1 ? 0 : 1);
+      }
+      return true;
+    } catch (e) {
+      console.warn("applyCrossSpanHighlight error", e);
+      return false;
+    }
+  };
+
+  const scrollToFirstHighlight = () => {
+    try {
+      const container = document.querySelector(".pdf-viewer-area");
+      if (!container) return false;
+
+      const first = container.querySelector(".pdf-highlight");
+      if (!first) return false;
+
+      const rect = first.getBoundingClientRect();
+      const contRect = container.getBoundingClientRect();
+      const top = rect.top - contRect.top + container.scrollTop;
+
+      const targetTop = Math.max(
+        0,
+        top - container.clientHeight / 2 + rect.height / 2,
+      );
+
+      container.scrollTo({ top: targetTop, behavior: "smooth" });
+      return true;
+    } catch (e) {
+      console.warn("scrollToFirstHighlight error", e);
+      return false;
+    }
+  };
+
+  const scheduleHighlightAndScroll = (term: any) => {
+    if (!term) return;
+    let tries = 0;
+    const maxTries = 20;
+
+    const step = () => {
+      applyCrossSpanHighlight(term);
+      if (scrollToFirstHighlight()) return;
+      if (++tries < maxTries) setTimeout(step, 50);
+    };
+    setTimeout(step, 0);
+  };
+
+  useEffect(() => {
+    scheduleHighlightAndScroll(highlightTerm);
+  }, [highlightTerm, pageNumber, scale]);
+
+  const onDrop = useCallback((accepted: File[]) => {
+    const pdf = accepted.find((f) => f.type === "application/pdf");
+    if (pdf) {
+      setError(null);
+      setFile(pdf);
+      setPageNumber(1);
+    } else {
+      setError("Please drop a PDF file.");
     }
   }, []);
 
   const { getRootProps, getInputProps, isDragActive } = useDropzone({
+    accept: { "application/pdf": [".pdf"] },
+    multiple: false,
     onDrop,
-    accept: { 'application/pdf': ['.pdf'] },
-    maxFiles: 1,
   });
 
-  const handleSearch = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const value = e.target.value;
-    setSearchText(value);
-    
-    if (value.trim() === '') {
-        clearHighlights();
-    } else {
-        highlight(value);
-    }
+  const handleDocumentLoad = useCallback(
+    ({ numPages: total }: { numPages: number }) => {
+      setNumPages(total);
+      setPageNumber(1);
+    },
+    [],
+  );
+
+  const canPrev = useMemo(() => !!file && pageNumber > 1, [file, pageNumber]);
+  const canNext = useMemo(
+    () => !!file && pageNumber < numPages,
+    [file, numPages, pageNumber],
+  );
+
+  const changePage = (delta: number) => {
+    setPageNumber((p) => Math.min(Math.max(p + delta, 1), numPages || 1));
   };
 
-  const clearSearch = () => {
-      setSearchText('');
-      clearHighlights();
+  const handleScale = (delta: number) => {
+    setScale((s) => {
+      const next = Number((s + delta).toFixed(2));
+      return Math.min(Math.max(next, 0.5), 3);
+    });
+  };
+
+  const handlePageInput = (value: string) => {
+    const next = Number(value);
+    if (!Number.isFinite(next)) return;
+    setPageNumber(Math.min(Math.max(next, 1), numPages || 1));
   };
 
   return (
-    <div className="h-screen w-full flex flex-col items-center justify-center p-6 box-border overflow-hidden">
-      
-      {/* Upload View (Empty State) */}
-      {!fileUrl && (
-        <div className="animate-in fade-in zoom-in duration-500 max-w-2xl w-full flex flex-col items-center">
-            <h1 className="text-5xl font-semibold text-white mb-4 tracking-tight">
-              PDF Phrase Hunter
-            </h1>
-            <p className="text-gray-400 text-xl mb-12 font-light">
-              Simple, fast, and secure local PDF search.
-            </p>
+    <div style={styles.appShell}>
+      <header style={styles.header}>
+        <h1 style={styles.title}>PDF Search Viewer</h1>
+        <p style={styles.subtitle}>
+          Drop a PDF below and navigate with the controls.
+        </p>
+      </header>
 
-            <div
-              {...getRootProps()}
-              className={clsx(
-                'w-full aspect-[16/9] rounded-3xl border border-dashed transition-all duration-300 flex flex-col items-center justify-center cursor-pointer backdrop-blur-xl',
-                isDragActive 
-                  ? 'border-blue-500 bg-blue-500/10 scale-[1.02]' 
-                  : 'border-white/10 bg-white/5 hover:bg-white/10 hover:border-white/20'
-              )}
-            >
-              <input {...getInputProps()} />
-              <div className="p-6 rounded-full bg-white/5 mb-6 text-white/50">
-                  <UploadCloud size={48} strokeWidth={1.5} />
-              </div>
-              <span className="text-2xl font-medium text-white mb-2">Drop PDF file here</span>
-              <span className="text-gray-400">or click to browse</span>
-            </div>
-        </div>
-      )}
+      <section style={styles.dropZone} {...getRootProps()}>
+        <input {...getInputProps()} />
+        {isDragActive ? (
+          <p>Drop the PDF here…</p>
+        ) : file ? (
+          <p>
+            Loaded: <strong>{file.name}</strong>
+          </p>
+        ) : (
+          <p>Drag & drop a PDF here, or click to select</p>
+        )}
+      </section>
 
-      {/* Viewer View (App Interface) */}
-      {fileUrl && (
-        <div className="w-full h-full max-w-[1400px] flex flex-col gap-4 animate-in fade-in slide-in-from-bottom-8 duration-500">
-            
-            {/* Toolbar - Floating Glass Bar */}
-            <div className="h-16 shrink-0 rounded-2xl bg-[#1c1c1e]/80 backdrop-blur-xl border border-white/10 flex items-center px-4 justify-between shadow-2xl z-20">
-                {/* File Info */}
-                <div className="flex items-center gap-3 min-w-0">
-                    <div className="w-10 h-10 rounded-xl bg-blue-500/20 flex items-center justify-center text-blue-400">
-                        <FileText size={20} strokeWidth={2} />
-                    </div>
-                    <div className="flex flex-col min-w-0">
-                        <span className="text-sm font-medium text-white truncate max-w-[200px]">{file?.name}</span>
-                        <button 
-                            onClick={() => { setFile(null); setFileUrl(''); }}
-                            className="text-xs text-gray-500 hover:text-white text-left transition-colors"
-                        >
-                            Close File
-                        </button>
-                    </div>
-                </div>
+      {error && <div style={styles.error}>{error}</div>}
 
-                {/* Search Bar - macOS Spotlight Style */}
-                <div className="flex-1 max-w-xl mx-4 relative group">
-                    <Search className="absolute left-3 top-1/2 -translate-y-1/2 text-gray-500 group-focus-within:text-white transition-colors" size={18} />
-                    <input
-                        type="text"
-                        placeholder="Search phrase..."
-                        value={searchText}
-                        onChange={handleSearch}
-                        className="w-full h-10 bg-black/20 border border-transparent focus:border-blue-500/50 rounded-xl pl-10 pr-10 text-white placeholder-gray-500 focus:outline-none focus:bg-black/40 transition-all font-light"
-                    />
-                    {searchText && (
-                        <button 
-                            onClick={clearSearch}
-                            className="absolute right-3 top-1/2 -translate-y-1/2 text-gray-500 hover:text-white p-0.5 rounded-full hover:bg-white/10 transition-all"
-                        >
-                            <X size={14} />
-                        </button>
-                    )}
-                </div>
+      <div style={styles.controls}>
+        <button
+          onClick={() => changePage(-1)}
+          disabled={!canPrev}
+          style={styles.button}
+        >
+          ◀ Prev
+        </button>
+        <span style={styles.pageInfo}>
+          Page{" "}
+          <input
+            type="number"
+            min={1}
+            max={numPages || 1}
+            value={pageNumber}
+            onChange={(e) => handlePageInput(e.target.value)}
+            style={styles.pageInput}
+            disabled={!file}
+          />{" "}
+          / {numPages || 0}
+        </span>
+        <button
+          onClick={() => changePage(1)}
+          disabled={!canNext}
+          style={styles.button}
+        >
+          Next ▶
+        </button>
+        <span style={{ flex: 1 }} />
+        <button
+          onClick={() => handleScale(-0.1)}
+          disabled={!file || scale <= 0.5}
+          style={styles.button}
+        >
+          −
+        </button>
+        <span style={styles.zoomLabel}>{Math.round(scale * 100)}%</span>
+        <button
+          onClick={() => handleScale(0.1)}
+          disabled={!file || scale >= 3}
+          style={styles.button}
+        >
+          +
+        </button>
+      </div>
 
-                {/* Right Placeholder (e.g., zoom controls could go here) */}
-                <div className="w-[150px] flex justify-end">
-                    {/* Future controls */}
-                </div>
-            </div>
-
-            {/* Viewer Container - Floating Window */}
-            <div className="flex-1 rounded-2xl overflow-hidden bg-[#1c1c1e] border border-white/10 shadow-2xl relative">
-                <Worker workerUrl={`https://unpkg.com/pdfjs-dist@${pdfjsVersion}/build/pdf.worker.min.js`}>
-                    <div className="absolute inset-0 overflow-y-auto">
-                        <Viewer
-                            fileUrl={fileUrl}
-                            plugins={[searchPluginInstance]}
-                            theme="dark"
-                            defaultScale={1.2}
-                        />
-                    </div>
-                </Worker>
-            </div>
-        </div>
-      )}
-
-      {/* Global Styles for PDF Viewer Overrides to match Apple Design */}
-      <style>{`
-        /* Hide default toolbar if it appears (we made our own) */
-        .rpv-core__inner-page {
-          background-color: transparent !important;
-          margin-bottom: 2rem !important;
-          box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1), 0 2px 4px -1px rgba(0, 0, 0, 0.06) !important;
-        }
-        
-        /* Highlight Color - Apple Yellow */
-        .rpv-search__highlight {
-            background-color: rgba(255, 214, 10, 0.4) !important; 
-            outline: 2px solid rgba(255, 214, 10, 0.8);
-            border-radius: 4px;
-        }
-
-        /* Current Match Highlight - Apple Orange */
-        .rpv-search__highlight--current {
-            background-color: rgba(255, 159, 10, 0.5) !important;
-            outline: 2px solid rgba(255, 159, 10, 1);
-            z-index: 10;
-        }
-      `}</style>
+      <div style={styles.viewer} className="pdf-viewer-area">
+        {file ? (
+          <Document
+            file={file}
+            onLoadSuccess={handleDocumentLoad}
+            onLoadError={(err) =>
+              setError(err?.message || "Failed to load PDF")
+            }
+          >
+            <Page
+              pageNumber={Math.min(Math.max(pageNumber, 1), numPages ?? 1)}
+              onRenderSuccess={() => scheduleHighlightAndScroll(highlightTerm)}
+              scale={scale}
+            />
+          </Document>
+        ) : (
+          <div style={styles.placeholder}>No PDF loaded.</div>
+        )}
+      </div>
     </div>
   );
-}
+};
+
+const styles: Record<string, CSSProperties> = {
+  appShell: {
+    maxWidth: 960,
+    margin: "0 auto",
+    padding: "32px 16px",
+    color: "#f5f5f5",
+  },
+  header: { textAlign: "center", marginBottom: 24 },
+  title: { margin: 0, fontSize: "28px", letterSpacing: "0.5px" },
+  subtitle: { margin: "6px 0 0", color: "#d0d0d0" },
+  dropZone: {
+    border: "2px dashed #4c8bf5",
+    borderRadius: 12,
+    padding: "28px 16px",
+    textAlign: "center",
+    background: "rgba(255,255,255,0.03)",
+    cursor: "pointer",
+  },
+  controls: {
+    display: "flex",
+    alignItems: "center",
+    gap: 12,
+    margin: "18px 0",
+    padding: "10px 12px",
+    borderRadius: 12,
+    background: "rgba(255,255,255,0.04)",
+    border: "1px solid rgba(255,255,255,0.08)",
+  },
+  button: {
+    padding: "8px 12px",
+    borderRadius: 8,
+    background: "#4c8bf5",
+    color: "#fff",
+    border: "none",
+    cursor: "pointer",
+    minWidth: 70,
+    fontWeight: 600,
+  },
+  pageInfo: { display: "flex", alignItems: "center", gap: 8, fontSize: 14 },
+  pageInput: {
+    width: 70,
+    padding: "6px 8px",
+    borderRadius: 6,
+    border: "1px solid rgba(255,255,255,0.2)",
+    background: "rgba(0,0,0,0.2)",
+    color: "#fff",
+  },
+  zoomLabel: { minWidth: 48, textAlign: "center" },
+  viewer: {
+    minHeight: 420,
+    maxHeight: "72vh",
+    overflow: "auto",
+    borderRadius: 12,
+    border: "1px solid rgba(255,255,255,0.08)",
+    background: "rgba(0,0,0,0.4)",
+    display: "flex",
+    justifyContent: "center",
+    alignItems: "center",
+    padding: 12,
+  },
+  placeholder: { color: "#cccccc" },
+  error: { marginTop: 12, color: "#ff6b6b", fontWeight: 600 },
+};
 
 export default App;

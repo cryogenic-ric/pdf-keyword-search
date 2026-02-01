@@ -6,21 +6,20 @@
   "homepage": "https:cryogenic-ric.github.io/pdfsearch",
   "scripts": {
     "dev": "vite",
-    "build": "tsc && vite build",
+    "build": "node --harmony-logical-assignment ./node_modules/typescript/bin/tsc && node --harmony-logical-assignment ./node_modules/vite/bin/vite.js build",
     "predeploy": "npm run build",
     "deploy": "gh-pages -d dist",
     "lint": "eslint . --ext ts,tsx --report-unused-disable-directives --max-warnings 0",
     "preview": "vite preview"
   },
   "dependencies": {
-    "@react-pdf-viewer/core": "^3.12.0",
-    "@react-pdf-viewer/search": "^3.12.0",
     "clsx": "^2.1.0",
     "lucide-react": "^0.330.0",
-    "pdfjs-dist": "^3.11.174",
+    "pdfjs-dist": "^4.8.69",
     "react": "^18.2.0",
     "react-dom": "^18.2.0",
     "react-dropzone": "^14.2.3",
+    "react-pdf": "^9.2.1",
     "tailwind-merge": "^2.2.1"
   },
   "devDependencies": {
