@@ -27,7 +27,7 @@ const App = () => {
   const [scale, setScale] = useState<number>(1.0);
   const [error, setError] = useState<string | null>(null);
 
-  const [highlightTerm] = useState<string | null>("deposited at");
+  const [highlightTerm] = useState<string | null>("amount");
 
   // Utility: escape regex special characters
   const escapeRegExp = (s: any) =>
@@ -80,6 +80,38 @@ const App = () => {
     return new RegExp(pattern, "gi");
   };
 
+  const highlightTextNodes = (element: HTMLElement, pattern: any) => {
+    // Convert to array because we will be adding new nodes (the <mark> tags)
+    // which can mess up live NodeList iteration
+    const children = Array.from(element.childNodes);
+
+    children.forEach((node: ChildNode) => {
+      if (node.nodeType === Node.TEXT_NODE) {
+        const text = node.nodeValue;
+        if (pattern.test(text)) {
+          const wrapper = document.createElement("span");
+          wrapper.innerHTML = (text ?? "").replace(
+            pattern,
+            (_match, pre, phrase, post) =>
+              `${pre}<mark class="pdf-highlight">${phrase}</mark>${post}`,
+          );
+
+          // Replace the old text node with the new HTML structure
+          while (wrapper.firstChild) {
+            element.insertBefore(wrapper.firstChild, node);
+          }
+          element.removeChild(node);
+        }
+      } else if (
+        node.nodeType === Node.ELEMENT_NODE &&
+        node instanceof HTMLElement
+      ) {
+        // If it's a nested span/element, recurse into it
+        highlightTextNodes(node, pattern);
+      }
+    });
+  };
+
   const applyCrossSpanHighlight = (term: string | null) => {
     try {
       if (!term?.trim()) return false;
@@ -97,6 +129,20 @@ const App = () => {
       // Only target the actual text spans inside the text layer
       const spans = Array.from(textLayer.querySelectorAll("span"));
       if (!spans.length) return false;
+
+      // check if full term in any of the spans
+      for (const span of spans) {
+        const spanText = span.textContent ?? "";
+        const spanPattern = new RegExp(
+          `(^|[^A-Za-z0-9])(${escapeRegExp(term.trim())})(?=$|[^A-Za-z0-9])`,
+          "gi", // Added 'g' flag to catch multiple occurrences if needed
+        );
+
+        if (spanPattern.test(spanText)) {
+          highlightTextNodes(span, spanPattern);
+          return false; // Found match, stop processing
+        }
+      }
 
       const contents = spans.map((s) => s.textContent ?? "");
 
@@ -409,6 +455,21 @@ const styles: Record<string, CSSProperties> = {
   },
   placeholder: { color: "#cccccc" },
   error: { marginTop: 12, color: "#ff6b6b", fontWeight: 600 },
+  highlight: {
+    backgroundColor: "yellow",
+    color: "inherit",
+    padding: 0,
+    margin: 0,
+    lineHeight: "inherit",
+    fontSize: "inherit",
+    fontFamily: "inherit",
+    verticalAlign: "baseline",
+    display: "inline",
+
+    /* avoid affecting positioning in some browsers */
+    position: "relative",
+    top: 0,
+  },
 };
 
 export default App;
