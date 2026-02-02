@@ -26,8 +26,9 @@ const App = () => {
   const [pageNumber, setPageNumber] = useState<number>(1);
   const [scale, setScale] = useState<number>(1.0);
   const [error, setError] = useState<string | null>(null);
+  const [textLayer, setTextLayer] = useState<HTMLElement | null>(null);
 
-  const [highlightTerm] = useState<string | null>("amount");
+  const [highlightTerm, setHighlightTerm] = useState<string>("examination");
 
   // Utility: escape regex special characters
   const escapeRegExp = (s: any) =>
@@ -80,6 +81,11 @@ const App = () => {
     return new RegExp(pattern, "gi");
   };
 
+  const getTextLayer = () =>
+    document.querySelector(
+      ".react-pdf__Page__textContent",
+    ) as HTMLElement | null;
+
   const highlightTextNodes = (element: HTMLElement, pattern: any) => {
     // Convert to array because we will be adding new nodes (the <mark> tags)
     // which can mess up live NodeList iteration
@@ -88,12 +94,14 @@ const App = () => {
     children.forEach((node: ChildNode) => {
       if (node.nodeType === Node.TEXT_NODE) {
         const text = node.nodeValue;
+        pattern.lastIndex = 0;
         if (pattern.test(text)) {
+          pattern.lastIndex = 0;
           const wrapper = document.createElement("span");
           wrapper.innerHTML = (text ?? "").replace(
             pattern,
             (_match, pre, phrase, post) =>
-              `${pre}<mark class="pdf-highlight">${phrase}</mark>${post}`,
+              `${pre}<mark class="pdf-highlight" data-cross="true">${phrase}</mark>${post}`,
           );
 
           // Replace the old text node with the new HTML structure
@@ -116,18 +124,28 @@ const App = () => {
     try {
       if (!term?.trim()) return false;
 
-      const textLayer = document.querySelector(
-        ".react-pdf__Page__textContent",
-      ) as HTMLElement | null;
-      if (!textLayer) return false;
+      const textLyr = getTextLayer();
+
+      if (!textLayer) {
+        // The 'true' argument ensures all children and text are cloned
+        if (textLyr) {
+          setTextLayer(textLyr.cloneNode(true) as HTMLElement);
+        }
+      } else {
+        if (textLyr) {
+          textLyr.innerHTML = textLayer.innerHTML; // textLayer remains unchanged
+        }
+      }
+      if (!textLyr) return false;
 
       // Remove previous cross-span highlights
-      textLayer.querySelectorAll('mark[data-cross="true"]').forEach((mark) => {
-        mark.replaceWith(...mark.childNodes);
+      textLyr.querySelectorAll('mark[data-cross="true"]').forEach((mark) => {
+        console.log(mark.textContent);
+        mark.replaceWith(...(mark.childNodes[0].nodeValue ?? []));
       });
 
       // Only target the actual text spans inside the text layer
-      const spans = Array.from(textLayer.querySelectorAll("span"));
+      const spans = Array.from(textLyr.querySelectorAll("span"));
       if (!spans.length) return false;
 
       // check if full term in any of the spans
@@ -135,12 +153,11 @@ const App = () => {
         const spanText = span.textContent ?? "";
         const spanPattern = new RegExp(
           `(^|[^A-Za-z0-9])(${escapeRegExp(term.trim())})(?=$|[^A-Za-z0-9])`,
-          "gi", // Added 'g' flag to catch multiple occurrences if needed
+          "i", // Added 'g' flag to catch multiple occurrences if needed
         );
 
         if (spanPattern.test(spanText)) {
           highlightTextNodes(span, spanPattern);
-          return false; // Found match, stop processing
         }
       }
 
@@ -236,16 +253,17 @@ const App = () => {
   };
 
   const scheduleHighlightAndScroll = (term: any) => {
+    console.log("Scheduling highlight and scroll for term:", term);
     if (!term) return;
     let tries = 0;
     const maxTries = 20;
 
     const step = () => {
-      applyCrossSpanHighlight(term);
-      if (scrollToFirstHighlight()) return;
+      applyCrossSpanHighlight(term); // ✅ run even if term is ""
+      if (term && scrollToFirstHighlight()) return; // only scroll when searching
       if (++tries < maxTries) setTimeout(step, 50);
     };
-    setTimeout(step, 0);
+    setTimeout(step, 50);
   };
 
   useEffect(() => {
@@ -323,6 +341,28 @@ const App = () => {
       </section>
 
       {error && <div style={styles.error}>{error}</div>}
+
+      <div style={styles.searchBar}>
+        <input
+          type="text"
+          placeholder="Search phrase..."
+          value={highlightTerm}
+          onChange={(e) => setHighlightTerm(e.target.value)}
+          style={styles.searchInput}
+        />
+        {highlightTerm && (
+          <button
+            onClick={() => {
+              setHighlightTerm("");
+              scheduleHighlightAndScroll("");
+            }}
+            style={styles.clearSearch}
+            title="Clear search"
+          >
+            ✕
+          </button>
+        )}
+      </div>
 
       <div style={styles.controls}>
         <button
@@ -469,6 +509,32 @@ const styles: Record<string, CSSProperties> = {
     /* avoid affecting positioning in some browsers */
     position: "relative",
     top: 0,
+  },
+  searchBar: {
+    margin: "12px 0",
+    display: "flex",
+    alignItems: "center",
+    position: "relative",
+  },
+  searchInput: {
+    width: "100%",
+    padding: "10px 40px 10px 16px",
+    borderRadius: 8,
+    border: "1px solid rgba(255,255,255,0.2)",
+    background: "rgba(255,255,255,0.05)",
+    color: "#fff",
+    fontSize: "16px",
+    outline: "none",
+  },
+  clearSearch: {
+    position: "absolute",
+    right: 12,
+    background: "none",
+    border: "none",
+    color: "#aaa",
+    cursor: "pointer",
+    fontSize: "18px",
+    padding: 0,
   },
 };
 
