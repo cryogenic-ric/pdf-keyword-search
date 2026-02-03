@@ -20,63 +20,41 @@ pdfjs.GlobalWorkerOptions.workerSrc = new URL(
 
 type FileLike = File | null;
 
+const SEP = "\u0000"; // sentinel between text nodes (unlikely to appear in PDFs)
+
 const App = () => {
   const [file, setFile] = useState<FileLike>(null);
   const [numPages, setNumPages] = useState<number>(0);
   const [pageNumber, setPageNumber] = useState<number>(1);
   const [scale, setScale] = useState<number>(1.0);
   const [error, setError] = useState<string | null>(null);
-  const [textLayer, setTextLayer] = useState<HTMLElement | null>(null);
 
-  const [highlightTerm, setHighlightTerm] = useState<string>("examination");
+  const [highlightTerm, setHighlightTerm] =
+    useState<string>("behavioral health");
 
   // Utility: escape regex special characters
   const escapeRegExp = (s: any) =>
     s?.replace(/[.*+?^${}()|[\]\\]/g, "\\$&") ?? "";
 
-  // Utility: escape text for safe innerHTML injection when marking cross-span highlights
-  const escapeHTML = (s: any) =>
-    String(s ?? "")
-      .replace(/&/g, "&amp;")
-      .replace(/</g, "&lt;")
-      .replace(/>/g, "&gt;")
-      .replace(/"/g, "&quot;")
-      .replace(/'/g, "&#39;");
-
-  /*
-   * Find all case-insensitive matches of term within text
-   */
-
-  // Apply highlighting for phrases that span multiple PDF text spans
-  const SEP = "\u0000"; // sentinel between spans (unlikely to appear in PDFs)
-
   const buildCrossSpanRegex = (term: string) => {
-    // 1. Escape the entire term so we treat it as literal chars initially
-    // 2. We want to allow the "SEP" (span boundary) to occur optionally between any two characters,
-    //    and we want to treat spaces in the query as matching one-or-more whitespace/separators in the text.
+    const trimmed = term.trim();
+    if (!trimmed) return null;
 
-    const escaped = escapeRegExp(term.trim());
-    if (!escaped) return null;
-
-    const chars = term.trim().split("");
+    const chars = trimmed.split("");
     let corePattern = "";
 
     for (let i = 0; i < chars.length; i++) {
-      const char = chars[i];
-      if (/\s/.test(char)) {
-        // It's a whitespace in the query
+      const ch = chars[i];
+      if (/\s/.test(ch)) {
+        // spaces in query match one-or-more whitespace or separators
         corePattern += `(?:\\s|${SEP})+`;
       } else {
-        // It's a non-whitespace char
-        corePattern += escapeRegExp(char);
-        // Allow optional separator after it, unless it's the last char
-        if (i < chars.length - 1) {
-          corePattern += `(?:${SEP})*`;
-        }
+        corePattern += escapeRegExp(ch);
+        if (i < chars.length - 1) corePattern += `(?:${SEP})*`;
       }
     }
 
-    // Wrap in whole-word boundaries.
+    // "word-ish" boundaries (same as your intent)
     const pattern = `(^|[^A-Za-z0-9])(${corePattern})(?=$|[^A-Za-z0-9])`;
     return new RegExp(pattern, "gi");
   };
@@ -86,140 +64,156 @@ const App = () => {
       ".react-pdf__Page__textContent",
     ) as HTMLElement | null;
 
-  const highlightTextNodes = (element: HTMLElement, pattern: any) => {
-    // Convert to array because we will be adding new nodes (the <mark> tags)
-    // which can mess up live NodeList iteration
-    const children = Array.from(element.childNodes);
+  /**
+   * Collect TEXT nodes only (preserves all nested spans/elements).
+   */
+  const collectTextNodes = (root: HTMLElement): Text[] => {
+    const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, {
+      acceptNode(node: any) {
+        const v = node.nodeValue ?? "";
+        // keep spaces too (PDF text often splits weirdly), just reject empty
+        if (v.length === 0) return NodeFilter.FILTER_REJECT;
+        return NodeFilter.FILTER_ACCEPT;
+      },
+    } as any);
 
-    children.forEach((node: ChildNode) => {
-      if (node.nodeType === Node.TEXT_NODE) {
-        const text = node.nodeValue;
-        pattern.lastIndex = 0;
-        if (pattern.test(text)) {
-          pattern.lastIndex = 0;
-          const wrapper = document.createElement("span");
-          wrapper.innerHTML = (text ?? "").replace(
-            pattern,
-            (_match, pre, phrase, post) =>
-              `${pre}<mark class="pdf-highlight" data-cross="true">${phrase}</mark>${post}`,
-          );
+    const nodes: Text[] = [];
+    let current: Node | null;
+    while ((current = walker.nextNode())) nodes.push(current as Text);
+    return nodes;
+  };
 
-          // Replace the old text node with the new HTML structure
-          while (wrapper.firstChild) {
-            element.insertBefore(wrapper.firstChild, node);
-          }
-          element.removeChild(node);
-        }
-      } else if (
-        node.nodeType === Node.ELEMENT_NODE &&
-        node instanceof HTMLElement
-      ) {
-        // If it's a nested span/element, recurse into it
-        highlightTextNodes(node, pattern);
-      }
+  /**
+   * Remove only our marks, restoring the DOM structure.
+   */
+  const removeCrossHighlights = (root: HTMLElement) => {
+    root.querySelectorAll('mark[data-cross="true"]').forEach((mark) => {
+      const parent = mark.parentNode;
+      if (!parent) return;
+
+      // unwrap
+      while (mark.firstChild) parent.insertBefore(mark.firstChild, mark);
+      parent.removeChild(mark);
+
+      // merge adjacent text nodes back
+      (parent as HTMLElement).normalize();
     });
   };
 
-  const applyCrossSpanHighlight = (term: string | null) => {
+  /**
+   * Wrap a range within a single Text node using splitText (safe + preserves nested spans).
+   * Ranges are relative to the node's ORIGINAL text. Must run in descending order.
+   */
+  const wrapRangesInTextNode = (
+    node: Text,
+    ranges: Array<{ start: number; end: number }>,
+  ) => {
+    if (!ranges.length) return;
+
+    // Sort descending so earlier splits don't invalidate later offsets
+    const sorted = [...ranges].sort((a, b) => b.start - a.start);
+
+    let current = node;
+
+    for (const { start, end } of sorted) {
+      const textLen = current.nodeValue?.length ?? 0;
+      if (start < 0 || end > textLen || start >= end) continue;
+
+      // split at end => [0..end) and [end..]
+      current.splitText(end);
+      // split at start => [0..start) and [start..end)
+      const middle = current.splitText(start);
+
+      const mark = document.createElement("mark");
+      mark.className = "pdf-highlight";
+      mark.dataset.cross = "true";
+
+      const parent = middle.parentNode;
+      if (!parent) continue;
+
+      parent.insertBefore(mark, middle);
+      mark.appendChild(middle);
+
+      // after splitting, `current` remains the prefix [0..start)
+      // so next (smaller) range still fits.
+    }
+  };
+
+  const applyCrossSpanHighlight = (term: string) => {
     try {
-      if (!term?.trim()) return false;
+      const layer = getTextLayer();
+      if (!layer) return false;
 
-      const textLyr = getTextLayer();
+      // always clear existing highlights first
+      removeCrossHighlights(layer);
 
-      if (!textLayer) {
-        // The 'true' argument ensures all children and text are cloned
-        if (textLyr) {
-          setTextLayer(textLyr.cloneNode(true) as HTMLElement);
-        }
-      } else {
-        if (textLyr) {
-          textLyr.innerHTML = textLayer.innerHTML; // textLayer remains unchanged
-        }
-      }
-      if (!textLyr) return false;
+      const trimmed = term.trim();
+      if (!trimmed) return true; // cleared
 
-      // Remove previous cross-span highlights
-      textLyr.querySelectorAll('mark[data-cross="true"]').forEach((mark) => {
-        console.log(mark.textContent);
-        mark.replaceWith(...(mark.childNodes[0].nodeValue ?? []));
-      });
+      const textNodes = collectTextNodes(layer);
+      if (!textNodes.length) return false;
 
-      // Only target the actual text spans inside the text layer
-      const spans = Array.from(textLyr.querySelectorAll("span"));
-      if (!spans.length) return false;
+      // Snapshot current text contents (important: do this BEFORE any wrapping)
+      const texts = textNodes.map((n) => n.nodeValue ?? "");
+      const fullText = texts.join(SEP);
 
-      // check if full term in any of the spans
-      for (const span of spans) {
-        const spanText = span.textContent ?? "";
-        const spanPattern = new RegExp(
-          `(^|[^A-Za-z0-9])(${escapeRegExp(term.trim())})(?=$|[^A-Za-z0-9])`,
-          "i", // Added 'g' flag to catch multiple occurrences if needed
-        );
-
-        if (spanPattern.test(spanText)) {
-          highlightTextNodes(span, spanPattern);
-        }
-      }
-
-      const contents = spans.map((s) => s.textContent ?? "");
-
-      // Build a virtual string that keeps a 1-char separator between spans.
-      let fullText = "";
-      for (let i = 0; i < contents.length; i++) {
-        fullText += contents[i];
-        if (i !== contents.length - 1) fullText += SEP;
-      }
-
-      const re = buildCrossSpanRegex(term);
+      const re = buildCrossSpanRegex(trimmed);
       if (!re) return false;
 
+      // Find global matches in the virtual string
       const matches: Array<{ start: number; end: number }> = [];
       let m: RegExpExecArray | null;
 
       while ((m = re.exec(fullText))) {
-        const prefixLen = m[1] ? m[1].length : 0;
-        const coreLen = m[2].length;
+        const prefixLen = m[1]?.length ?? 0;
+        const coreLen = m[2]?.length ?? 0;
         const matchStart = m.index + prefixLen;
         const matchEnd = matchStart + coreLen;
         matches.push({ start: matchStart, end: matchEnd });
       }
       if (!matches.length) return false;
 
-      // Map global indices back to spans
+      // Build metadata: global offsets for each text node in the virtual string
+      const meta = [];
       let cursor = 0;
-      for (let i = 0; i < spans.length; i++) {
-        const span = spans[i];
-        const spanText = contents[i];
-        const spanStart = cursor;
-        const spanEnd = cursor + spanText.length;
+      for (let i = 0; i < textNodes.length; i++) {
+        const len = texts[i].length;
+        meta.push({
+          node: textNodes[i],
+          start: cursor,
+          end: cursor + len,
+          len,
+        });
+        cursor += len + (i === textNodes.length - 1 ? 0 : 1); // +1 for SEP
+      }
 
-        let newHTML = "";
-        let lastIndex = 0;
+      // Map global matches -> per-node local ranges
+      const perNodeRanges = new Map<
+        Text,
+        Array<{ start: number; end: number }>
+      >();
 
-        for (const { start, end } of matches) {
-          const overlapStart = Math.max(start, spanStart);
-          const overlapEnd = Math.min(end, spanEnd);
+      for (const { start, end } of matches) {
+        for (const info of meta) {
+          const overlapStart = Math.max(start, info.start);
+          const overlapEnd = Math.min(end, info.end);
 
           if (overlapStart < overlapEnd) {
-            const localStart = overlapStart - spanStart;
-            const localEnd = overlapEnd - spanStart;
+            const localStart = overlapStart - info.start;
+            const localEnd = overlapEnd - info.start;
 
-            newHTML += escapeHTML(spanText.slice(lastIndex, localStart));
-            newHTML += `<mark class="pdf-highlight" data-cross="true">${escapeHTML(
-              spanText.slice(localStart, localEnd),
-            )}</mark>`;
-            lastIndex = localEnd;
+            const arr = perNodeRanges.get(info.node) ?? [];
+            arr.push({ start: localStart, end: localEnd });
+            perNodeRanges.set(info.node, arr);
           }
         }
-
-        newHTML += escapeHTML(spanText.slice(lastIndex));
-
-        if (newHTML !== escapeHTML(spanText)) {
-          span.innerHTML = newHTML;
-        }
-
-        cursor = spanEnd + (i === spans.length - 1 ? 0 : 1);
       }
+
+      // Apply wraps per text node (does NOT touch innerHTML, preserves nested spans)
+      for (const [node, ranges] of perNodeRanges.entries()) {
+        wrapRangesInTextNode(node, ranges);
+      }
+
       return true;
     } catch (e) {
       console.warn("applyCrossSpanHighlight error", e);
@@ -229,10 +223,14 @@ const App = () => {
 
   const scrollToFirstHighlight = () => {
     try {
-      const container = document.querySelector(".pdf-viewer-area");
+      const container = document.querySelector(
+        ".pdf-viewer-area",
+      ) as HTMLElement | null;
       if (!container) return false;
 
-      const first = container.querySelector(".pdf-highlight");
+      const first = container.querySelector(
+        ".pdf-highlight",
+      ) as HTMLElement | null;
       if (!first) return false;
 
       const rect = first.getBoundingClientRect();
@@ -252,22 +250,24 @@ const App = () => {
     }
   };
 
-  const scheduleHighlightAndScroll = (term: any) => {
-    console.log("Scheduling highlight and scroll for term:", term);
-    if (!term) return;
+  const scheduleHighlightAndScroll = (term: string) => {
+    if (term == null) return;
+
     let tries = 0;
     const maxTries = 20;
 
     const step = () => {
-      applyCrossSpanHighlight(term); // ✅ run even if term is ""
-      if (term && scrollToFirstHighlight()) return; // only scroll when searching
+      const ok = applyCrossSpanHighlight(term);
+      if (term.trim() && ok && scrollToFirstHighlight()) return;
       if (++tries < maxTries) setTimeout(step, 50);
     };
+
     setTimeout(step, 50);
   };
 
   useEffect(() => {
     scheduleHighlightAndScroll(highlightTerm);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [highlightTerm, pageNumber, scale]);
 
   const onDrop = useCallback((accepted: File[]) => {
@@ -372,6 +372,7 @@ const App = () => {
         >
           ◀ Prev
         </button>
+
         <span style={styles.pageInfo}>
           Page{" "}
           <input
@@ -385,6 +386,7 @@ const App = () => {
           />{" "}
           / {numPages || 0}
         </span>
+
         <button
           onClick={() => changePage(1)}
           disabled={!canNext}
@@ -392,7 +394,9 @@ const App = () => {
         >
           Next ▶
         </button>
+
         <span style={{ flex: 1 }} />
+
         <button
           onClick={() => handleScale(-0.1)}
           disabled={!file || scale <= 0.5}
@@ -495,21 +499,6 @@ const styles: Record<string, CSSProperties> = {
   },
   placeholder: { color: "#cccccc" },
   error: { marginTop: 12, color: "#ff6b6b", fontWeight: 600 },
-  highlight: {
-    backgroundColor: "yellow",
-    color: "inherit",
-    padding: 0,
-    margin: 0,
-    lineHeight: "inherit",
-    fontSize: "inherit",
-    fontFamily: "inherit",
-    verticalAlign: "baseline",
-    display: "inline",
-
-    /* avoid affecting positioning in some browsers */
-    position: "relative",
-    top: 0,
-  },
   searchBar: {
     margin: "12px 0",
     display: "flex",
